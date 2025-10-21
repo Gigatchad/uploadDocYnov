@@ -5,7 +5,7 @@ const { FieldValue } = require('firebase-admin/firestore');
 const { sendAccessEmail } = require('../services/mailer');
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
-const ALLOWED_NIVEAUX = ['Licence', 'Master', 'Cycle ingénieur', 'MBA']; // adapte si besoin
+const ALLOWED_NIVEAUX = ['B1', 'B2', 'B3', 'M1', 'M2'];
 
 function displayNameOf(prenom, nom) {
   const p = (prenom || '').trim();
@@ -14,14 +14,9 @@ function displayNameOf(prenom, nom) {
 }
 
 /**
- * POST /api/users (ADMIN ONLY)
- * body commun:
- *  - email        (obligatoire) = email @école (login Firebase)
- *  - notifyEmail  (obligatoire) = email personnel (destinataire du mail)
- *  - role: 'etudiant'|'parent'|'personnel'
- *  - prenom, nom
- * body étudiant: { filiere, niveau }
- * body parent:   { parentOf: [uidEtudiant, ...] }  // exclusivité: un seul parent par étudiant
+ * POST /api/users  (ADMIN)
+ * body commun: { email (login école), notifyEmail (perso), role, prenom, nom }
+ * étudiant: { filiere, niveau } ; parent: { parentOf:[uid,...] }
  */
 async function createUser(req, res) {
   const { role, email, notifyEmail, prenom, nom, filiere, niveau, parentOf } = req.body || {};
@@ -29,7 +24,9 @@ async function createUser(req, res) {
   const a = auth();
   const firestore = db();
 
-  // Règles métier
+  // Règles
+  if (!email || !notifyEmail || !role) return res.status(400).json({ error: 'MISSING_FIELDS' });
+
   if (role === 'etudiant') {
     if (!filiere) return res.status(400).json({ error: 'filiere requise' });
     if (!niveau || !ALLOWED_NIVEAUX.includes(niveau)) {
@@ -45,7 +42,7 @@ async function createUser(req, res) {
     }
   }
 
-  // collision email (sur l'email @école = login)
+  // collision email (login)
   try {
     const existing = await a.getUserByEmail(email);
     if (existing) return res.status(409).json({ error: 'email (login) déjà utilisé' });
@@ -56,11 +53,11 @@ async function createUser(req, res) {
   const displayName = displayNameOf(prenom, nom);
   const displayNameLower = displayName ? displayName.toLowerCase() : null;
 
-  // 1) Crée l'utilisateur Auth avec l'email @école (sans mot de passe)
+  // 1) créer Auth
   let createdUser;
   try {
     createdUser = await a.createUser({
-      email, // <— LOGIN = email @école
+      email,
       displayName: displayName || undefined,
       emailVerified: false,
       disabled: false
@@ -80,12 +77,12 @@ async function createUser(req, res) {
     return res.status(500).json({ error: 'CLAIMS_SET_FAILED', details: e.message });
   }
 
-  // 3) Firestore (transaction si parent) — stocke email (login) + notifyEmail (personnel)
+  // 3) Firestore (transaction si parent)
   try {
-    const userDoc = {
+    const baseDoc = {
       role,
       email,                      // login (@école)
-      notifyEmail: notifyEmail,   // contact (personnel)
+      notifyEmail,                // perso
       prenom: prenom || null,
       nom: nom || null,
       displayName: displayName || null,
@@ -96,24 +93,35 @@ async function createUser(req, res) {
     };
 
     if (role === 'etudiant') {
-      Object.assign(userDoc, { filiere, niveau, parentUid: null });
-      await firestore.collection('users').doc(uid).set(userDoc, { merge: true });
+      await firestore.collection('users').doc(uid)
+        .set({ ...baseDoc, filiere, niveau, parentUid: null }, { merge: true });
+
     } else if (role === 'personnel') {
-      await firestore.collection('users').doc(uid).set(userDoc, { merge: true });
+      await firestore.collection('users').doc(uid).set(baseDoc, { merge: true });
+
     } else if (role === 'parent') {
       await firestore.runTransaction(async (tx) => {
         const parentRef = firestore.collection('users').doc(uid);
-        tx.set(parentRef, { ...userDoc, parentOf }, { merge: true });
 
-        for (const childUid of parentOf) {
-          const childRef = firestore.collection('users').doc(childUid);
-          const childSnap = await tx.get(childRef);
-          if (!childSnap.exists) throw new Error(`Etudiant ${childUid} introuvable`);
-          const child = childSnap.data();
+        // Lire tous les enfants et valider exclusivité
+        const childRefs = parentOf.map((childUid) => firestore.collection('users').doc(childUid));
+        const childSnaps = await Promise.all(childRefs.map((ref) => tx.get(ref)));
+
+        childSnaps.forEach((snap, idx) => {
+          const childUid = parentOf[idx];
+          if (!snap.exists) throw new Error(`Etudiant ${childUid} introuvable`);
+          const child = snap.data();
           if (child.role !== 'etudiant') throw new Error(`UID ${childUid} n'est pas un etudiant`);
-          if (child.parentUid && child.parentUid !== null) throw new Error(`Etudiant ${childUid} déjà associé à un parent`);
-          tx.update(childRef, { parentUid: uid, updatedAt: FieldValue.serverTimestamp() });
-        }
+          if (child.parentUid && child.parentUid !== null) {
+            throw new Error(`Etudiant ${childUid} déjà associé à un parent`);
+          }
+        });
+
+        // Ecrire parent + attacher enfants
+        tx.set(parentRef, { ...baseDoc, parentOf }, { merge: true });
+        childRefs.forEach((ref) => {
+          tx.update(ref, { parentUid: uid, updatedAt: FieldValue.serverTimestamp() });
+        });
       });
     }
   } catch (e) {
@@ -121,34 +129,26 @@ async function createUser(req, res) {
     return res.status(500).json({ error: 'PERSISTENCE_FAILED', details: e.message });
   }
 
-  // 4) Reset link — généré pour l'email de login (@école)
+  // 4) Lien reset (non bloquant)
   let resetLink = null;
   try {
     resetLink = await a.generatePasswordResetLink(email, { url: FRONTEND_URL });
-  } catch (e) {
-    resetLink = null; // non bloquant
-  }
+  } catch (_) {}
 
-  // 5) Envoi d'email — vers l'email personnel (notifyEmail)
- try {
-  await sendAccessEmail(notifyEmail, { loginEmail: email, resetLink });
-  await auditLog(req, 'EMAIL_SEND', { collection: 'users', id: uid }, { to: notifyEmail, type: 'welcome' });
-} catch (_) {
-    // non bloquant
-  }
+  // 5) Email d’accès (non bloquant)
+  try {
+    await sendAccessEmail(notifyEmail, { loginEmail: email, resetLink });
+    await auditLog(req, 'EMAIL_SEND', { collection: 'users', id: uid }, { to: notifyEmail, type: 'welcome' });
+  } catch (_) {}
 
-  // 6) Log de création (action)
+  // 6) Audit création
   const meta = { role, email, notifyEmail };
   if (role === 'etudiant') Object.assign(meta, { filiere, niveau });
   if (role === 'parent') Object.assign(meta, { parentOf });
   await auditLog(req, 'USER_CREATE', { collection: 'users', id: uid }, meta);
 
   return res.status(201).json({
-    uid,
-    role,
-    email,               // login @école
-    notifyEmail,         // contact personnel
-    resetLink
+    uid, role, email, notifyEmail, resetLink
   });
 }
 
