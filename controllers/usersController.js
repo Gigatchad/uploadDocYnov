@@ -3,6 +3,7 @@ const { auth, db } = require('../firebase');
 const { auditLog } = require('../services/audit');
 const { FieldValue } = require('firebase-admin/firestore');
 const { sendAccessEmail } = require('../services/mailer');
+const { createInviteToken } = require('../services/invite');
 
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
 const ALLOWED_NIVEAUX = ['B1', 'B2', 'B3', 'M1', 'M2'];
@@ -15,7 +16,7 @@ function displayNameOf(prenom, nom) {
 
 /**
  * POST /api/users  (ADMIN)
- * body commun: { email (login école), notifyEmail (perso), role, prenom, nom }
+ * body commun: { email (login), notifyEmail (perso), role, prenom, nom }
  * étudiant: { filiere, niveau } ; parent: { parentOf:[uid,...] }
  */
 async function createUser(req, res) {
@@ -81,13 +82,14 @@ async function createUser(req, res) {
   try {
     const baseDoc = {
       role,
-      email,                      // login (@école)
+      email,                      // login
       notifyEmail,                // perso
       prenom: prenom || null,
       nom: nom || null,
       displayName: displayName || null,
       displayNameLower,
       fcmTokens: [],
+      passwordSetAt: null,        // rempli après création du mot de passe
       createdAt: FieldValue.serverTimestamp(),
       updatedAt: FieldValue.serverTimestamp()
     };
@@ -129,15 +131,16 @@ async function createUser(req, res) {
     return res.status(500).json({ error: 'PERSISTENCE_FAILED', details: e.message });
   }
 
-  // 4) Lien reset (non bloquant)
-  let resetLink = null;
+  // 4) Notre lien d’invitation → vers /new-user?t=...
+  let inviteLink = null;
   try {
-    resetLink = await a.generatePasswordResetLink(email, { url: FRONTEND_URL });
-  } catch (_) {}
+    const token = await createInviteToken({ uid, email, ttlHours: 48 });
+    inviteLink = `${FRONTEND_URL}/new-user?t=${encodeURIComponent(token)}`;
+  } catch (_) { /* non bloquant */ }
 
-  // 5) Email d’accès (non bloquant)
+  // 5) Email d’accès (avec NOTRE lien)
   try {
-    await sendAccessEmail(notifyEmail, { loginEmail: email, resetLink });
+    await sendAccessEmail(notifyEmail, { loginEmail: email, resetLink: inviteLink });
     await auditLog(req, 'EMAIL_SEND', { collection: 'users', id: uid }, { to: notifyEmail, type: 'welcome' });
   } catch (_) {}
 
@@ -148,7 +151,7 @@ async function createUser(req, res) {
   await auditLog(req, 'USER_CREATE', { collection: 'users', id: uid }, meta);
 
   return res.status(201).json({
-    uid, role, email, notifyEmail, resetLink
+    uid, role, email, notifyEmail, inviteLink
   });
 }
 

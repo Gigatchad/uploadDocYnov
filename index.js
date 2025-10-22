@@ -15,6 +15,9 @@ const adminRoutes = require('./routes/admin.routes');
 const logsRoutes = require('./routes/logs.routes');
 const usersQueryRoutes = require('./routes/users.query.routes');
 const usersMutationsRoutes = require('./routes/users.mutations.routes');
+const passwordRoutes = require('./routes/password.routes');
+const notificationsRoutes = require('./routes/notifications.routes');
+
 initFirebase();
 
 const app = express();
@@ -53,6 +56,13 @@ app.use('/api', logsRoutes);
 app.use('/api', usersRoutes);
 app.use('/api', usersQueryRoutes);
 app.use('/api', usersMutationsRoutes);
+app.use('/api', passwordRoutes);
+app.use('/api', require('./routes/auth.invite.routes'));
+app.use('/api', require('./routes/session.routes'));
+app.use('/api', require('./routes/cloudinary.routes'));
+app.use('/api', require('./routes/requests.routes'));
+app.use('/api', require('./routes/parent.routes'));
+app.use('/api', notificationsRoutes);
 // 404 & erreurs simples
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 
